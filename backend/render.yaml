@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: raglens-backend
+    env: python
+    region: oregon
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: http://localhost:5173,http://localhost:3000,https://ragglass.vercel.app,https://raglens.vercel.app
+      - key: LLM_PROVIDER
+        value: groq
+      - key: EMBEDDING_PROVIDER
+        value: huggingface
+      - key: DATABASE_URL
+        value: sqlite:///./ragglass.db
+      - key: CHROMA_PERSIST_DIR
+        value: ./chroma_db

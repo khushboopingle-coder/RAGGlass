@@ -1,0 +1,15 @@
+# Environment variables
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+venv_*/
+
+# Storage & Database
+*.db
+chroma_db/
