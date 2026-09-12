@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: raglens-backend
+    name: ragglass-backend
     env: python
     region: oregon
     plan: free
