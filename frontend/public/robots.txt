@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ragglass.vercel.app/sitemap.xml
