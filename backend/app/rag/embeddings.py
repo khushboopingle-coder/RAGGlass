@@ -1,7 +1,7 @@
 import os
 import logging
 import httpx
-from typing import List, Dict, Any, Union
+from typing import List, Any
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
@@ -16,12 +16,12 @@ EMBEDDING_DIMENSIONS = 384
 HF_INFERENCE_ENDPOINT = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_NAME}/pipeline/feature-extraction"
 
 _local_model_instance = None
+_fastembed_instance = None
+
 
 def get_local_embedding_model():
     """
-    Lazily load local SentenceTransformer model.
-    Import is deferred so deployments using EMBEDDING_PROVIDER=huggingface do not
-    require sentence-transformers or PyTorch to be installed.
+    Lazily load local SentenceTransformer model (needs sentence-transformers installed).
     """
     global _local_model_instance
     if _local_model_instance is None:
@@ -31,16 +31,35 @@ def get_local_embedding_model():
             logger.error("sentence-transformers package not installed.")
             raise HTTPException(
                 status_code=500,
-                detail="Local embedding package 'sentence-transformers' is not installed. Install it or set EMBEDDING_PROVIDER=huggingface."
+                detail="Local embedding package 'sentence-transformers' is not installed. Set EMBEDDING_PROVIDER=huggingface or fastembed."
             )
         logger.info(f"[RAGGlass] Loading local SentenceTransformer model: {MODEL_NAME}...")
         _local_model_instance = SentenceTransformer(MODEL_NAME)
         logger.info(f"[RAGGlass] Model {MODEL_NAME} loaded successfully ({EMBEDDING_DIMENSIONS} dimensions).")
     return _local_model_instance
 
+
+def _generate_fastembed_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Free, lightweight embeddings using ONNX (no API key, no credits, no PyTorch).
+    Same model as before: all-MiniLM-L6-v2, 384 dimensions.
+    """
+    global _fastembed_instance
+    try:
+        if _fastembed_instance is None:
+            from fastembed import TextEmbedding
+            logger.info("[RAGGlass] Loading fastembed model %s...", HF_MODEL_NAME)
+            _fastembed_instance = TextEmbedding(model_name=HF_MODEL_NAME)
+            logger.info("[RAGGlass] fastembed model loaded.")
+        return [vec.tolist() for vec in _fastembed_instance.embed(texts)]
+    except Exception as e:
+        logger.error("FASTEMBED FAILED: %s", repr(e))
+        raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
+
+
 def _mean_pooling(token_embeddings: List[List[float]]) -> List[float]:
     """
-    Perform mean pooling over token embeddings if Hugging Face API returns token-level vectors.
+    Mean pooling over token embeddings if the API returns token-level vectors.
     """
     if not token_embeddings:
         return [0.0] * EMBEDDING_DIMENSIONS
@@ -52,41 +71,43 @@ def _mean_pooling(token_embeddings: List[List[float]]) -> List[float]:
             sum_vec[i] += token[i]
     return [val / num_tokens for val in sum_vec]
 
+
 def _parse_hf_response(data: Any, expected_count: int) -> List[List[float]]:
     """
-    Parse Hugging Face Inference API feature extraction output into List[List[float]] of shape (expected_count, 384).
+    Parse Hugging Face feature extraction output into shape (expected_count, 384).
     """
     if not isinstance(data, list):
         logger.error("Unexpected output format from Hugging Face Inference API.")
         raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
 
-    # Case 1: 1D list of floats for a single text input [float, ...]
+    # 1D list of floats for a single text
     if expected_count == 1 and data and isinstance(data[0], (int, float)):
         return [data]
 
-    # Case 2: 2D list of floats [[float, ...], [float, ...]] -> shape (expected_count, 384)
+    # 2D list [[float, ...], ...]
     if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], (int, float)):
         if len(data) == expected_count:
             return data
         elif expected_count == 1:
             return [_mean_pooling(data)]
 
-    # Case 3: 3D list of floats [[[float, ...], ...], ...] -> shape (expected_count, tokens, 384)
+    # 3D list [[[float, ...], ...], ...]
     if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], list):
         results = []
         for sentence_tokens in data:
             if isinstance(sentence_tokens, list) and sentence_tokens and isinstance(sentence_tokens[0], list):
                 results.append(_mean_pooling(sentence_tokens))
-            elif isinstance(sentence_tokens, list) and isinstance(sentence_tokens[0], (int, float)):
+            elif isinstance(sentence_tokens, list) and sentence_tokens and isinstance(sentence_tokens[0], (int, float)):
                 results.append(sentence_tokens)
         return results
 
     logger.error("Unable to parse Hugging Face embedding output structure.")
     raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
 
+
 def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Generate embeddings by querying the Hugging Face Inference API.
+    Generate embeddings through the Hugging Face Inference API.
     """
     import time
 
@@ -102,11 +123,8 @@ def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
         "Authorization": f"Bearer {hf_key}",
         "Content-Type": "application/json"
     }
-
     payload = {"inputs": texts}
 
-    last_status = None
-    last_body = ""
     for attempt in range(3):
         try:
             with httpx.Client(timeout=60.0) as client:
@@ -118,9 +136,7 @@ def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
         if resp.status_code == 200:
             return _parse_hf_response(resp.json(), expected_count=len(texts))
 
-        last_status = resp.status_code
-        last_body = resp.text[:300]
-        logger.error("HF EMBEDDING FAILED attempt %s: status=%s body=%s", attempt + 1, last_status, last_body)
+        logger.error("HF EMBEDDING FAILED attempt %s: status=%s body=%s", attempt + 1, resp.status_code, resp.text[:300])
 
         # Model still loading or rate limited: wait and retry
         if resp.status_code in (429, 503):
@@ -130,10 +146,16 @@ def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
 
     raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
 
+
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Generate 384-dimensional dense embeddings for a list of text strings.
-    Dispatches between local sentence-transformers and Hugging Face Inference API based on EMBEDDING_PROVIDER.
+    Generate 384-dimensional embeddings for a list of texts.
+
+    EMBEDDING_PROVIDER:
+      - "huggingface": try the Hugging Face API first; if it fails
+                       (no credits, rate limit, outage), fall back to fastembed.
+      - "fastembed":   use fastembed directly (free, no API key).
+      - anything else: use local sentence-transformers.
     """
     if not texts:
         return []
@@ -141,15 +163,22 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
     provider = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
 
     if provider == "huggingface":
-        return _generate_huggingface_embeddings(texts)
+        try:
+            return _generate_huggingface_embeddings(texts)
+        except HTTPException:
+            logger.warning("Hugging Face embeddings failed, falling back to fastembed.")
+            return _generate_fastembed_embeddings(texts)
+    elif provider == "fastembed":
+        return _generate_fastembed_embeddings(texts)
     else:
         model = get_local_embedding_model()
         embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
         return embeddings.tolist()
 
+
 def generate_single_embedding(text: str) -> List[float]:
     """
-    Generate embedding vector for a single query text string.
+    Generate embedding vector for a single query text.
     """
     results = generate_embeddings([text])
     if results and len(results) > 0:
