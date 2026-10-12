@@ -86,11 +86,13 @@ def _parse_hf_response(data: Any, expected_count: int) -> List[List[float]]:
 
 def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Generate embeddings by querying the free Hugging Face Inference API.
+    Generate embeddings by querying the Hugging Face Inference API.
     """
-    hf_key = os.getenv("HF_API_KEY", "").strip()
+    import time
+
+    hf_key = os.getenv("HF_API_KEY", "").strip().strip('"').strip("'")
     if not hf_key or hf_key == "paste_your_hf_token_here":
-        logger.warning("Hugging Face provider selected, but HF_API_KEY is not configured or uses default placeholder.")
+        logger.error("HF_API_KEY is missing or still the placeholder.")
         raise HTTPException(
             status_code=503,
             detail="Embedding service temporarily unavailable. Please configure a valid HF_API_KEY."
@@ -101,28 +103,32 @@ def _generate_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "inputs": texts,
-        "options": {
-            "wait_for_model": True
-        }
-    }
+    payload = {"inputs": texts}
 
-    try:
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(HF_INFERENCE_ENDPOINT, headers=headers, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                return _parse_hf_response(data, expected_count=len(texts))
-
-            # Internal logging without leaking key or raw body
-            logger.error("Hugging Face API call returned HTTP status code %s", resp.status_code)
+    last_status = None
+    last_body = ""
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(HF_INFERENCE_ENDPOINT, headers=headers, json=payload)
+        except Exception as e:
+            logger.error("HF EMBEDDING CONNECTION ERROR: %s", repr(e))
             raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Hugging Face API connection error.")
-        raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
+
+        if resp.status_code == 200:
+            return _parse_hf_response(resp.json(), expected_count=len(texts))
+
+        last_status = resp.status_code
+        last_body = resp.text[:300]
+        logger.error("HF EMBEDDING FAILED attempt %s: status=%s body=%s", attempt + 1, last_status, last_body)
+
+        # Model still loading or rate limited: wait and retry
+        if resp.status_code in (429, 503):
+            time.sleep(5)
+            continue
+        break
+
+    raise HTTPException(status_code=503, detail="Embedding service temporarily unavailable.")
 
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """
